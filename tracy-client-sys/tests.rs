@@ -25,6 +25,7 @@ mod tests {
     /// Cannot use a libtest harness here because we need manual control over
     /// the profiler startup and shutdown.
     pub(crate) fn main() {
+        #[cfg(feature = "manual-lifetime")]
         unsafe {
             ___tracy_startup_profiler();
         }
@@ -32,6 +33,7 @@ mod tests {
         test_emit_message_no_null();
         unsafe {
             ___tracy_fiber_enter(b"hello".as_ptr().cast());
+            #[cfg(feature = "manual-lifetime")]
             ___tracy_shutdown_profiler();
         }
     }

@@ -28,6 +28,8 @@
 #![doc = include_str!("../FEATURES.mkd")]
 #![cfg_attr(tracy_client_docs, feature(doc_auto_cfg))]
 
+#[cfg(feature = "fibers")]
+pub use crate::fiber::FiberHandle;
 pub use crate::frame::{frame_mark, Frame, FrameName};
 pub use crate::gpu::{
     GpuContext, GpuContextCreationError, GpuContextType, GpuSpan, GpuSpanCreationError,
@@ -36,8 +38,12 @@ pub use crate::plot::PlotName;
 pub use crate::span::{Span, SpanLocation};
 use std::alloc;
 use std::ffi::CString;
+#[cfg(feature = "fibers")]
+use std::{ffi::CStr, sync::Arc};
 pub use sys;
 
+#[cfg(feature = "fibers")]
+mod fiber;
 mod frame;
 mod gpu;
 mod plot;
@@ -172,6 +178,16 @@ impl Client {
             // SAFE: `name` is a valid null-terminated string.
             internal::set_thread_name(name.as_ptr().cast());
         }
+    }
+
+    /// Enters the fiber with provided name.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the name contains interior null characters.
+    #[cfg(feature = "fibers")]
+    pub fn allocate_fiber_handle(&self, name: Arc<CStr>) -> FiberHandle {
+        FiberHandle::new(name)
     }
 }
 

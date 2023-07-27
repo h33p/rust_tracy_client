@@ -50,8 +50,15 @@
 
 use client::{Client, Span};
 pub use config::{Config, DefaultConfig};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{fmt::Write, mem};
+#[cfg(feature = "fibers")]
+use std::cell::RefCell;
+#[cfg(feature = "fibers")]
+use std::ffi::{CStr, CString};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, RwLock,
+};
+use std::{collections::BTreeMap, fmt::Write, mem};
 use tracing_core::{
     field::{Field, Visit},
     span::{Attributes, Id, Record},
@@ -60,7 +67,7 @@ use tracing_core::{
 use tracing_subscriber::fmt::format::FormatFields;
 use tracing_subscriber::{
     layer::{Context, Layer},
-    registry,
+    registry::{self, SpanRef},
 };
 use utils::{StrCache, StrCacheGuard, VecCell};
 
@@ -71,8 +78,17 @@ type TracyFields<C> = tracing_subscriber::fmt::FormattedFields<<C as Config>::Fo
 
 thread_local! {
     /// A stack of spans currently active on the current thread.
-    static TRACY_SPAN_STACK: VecCell<(Span, u64)> = const { VecCell::new() };
+    static TRACY_SPAN_STACK: VecCell<(Span, Arc<SpanInfo>, u64)> = const { VecCell::new() };
+    #[cfg(feature = "fibers")]
+    static TRACY_FIBERS_CACHE: RefCell<BTreeMap<*const str, Arc<CStr>>> = RefCell::new(BTreeMap::new());
 }
+
+struct SpanInfo {
+    #[cfg(feature = "fibers")]
+    fiber: client::FiberHandle,
+}
+
+static TRACY_SPAN_INFO: RwLock<BTreeMap<u64, Arc<SpanInfo>>> = RwLock::new(BTreeMap::new());
 
 /// A tracing layer that collects data in Tracy profiling format.
 ///
@@ -135,6 +151,51 @@ impl<C: Config> TracyLayer<C> {
             data
         }
     }
+
+    fn span_info<S: Subscriber + for<'a> registry::LookupSpan<'a>>(
+        &self,
+        _span: &SpanRef<S>,
+    ) -> SpanInfo {
+        #[cfg(feature = "fibers")]
+        {
+            let metadata = _span.metadata();
+
+            let fiber = TRACY_FIBERS_CACHE.with(|c| {
+                c.borrow_mut()
+                    .entry(metadata.name() as *const str)
+                    .or_insert_with(|| {
+                        let thread = std::thread::current();
+
+                        let mut fiber = if let Some(name) = thread.name() {
+                            format!("{name} - {}", metadata.name())
+                        } else {
+                            format!("{:?} - {}", thread.id(), metadata.name())
+                        }
+                        .into_bytes();
+
+                        for c in &mut fiber {
+                            if *c == 0 {
+                                *c = ' ' as u8;
+                            }
+                        }
+
+                        fiber.push(0);
+
+                        let fiber = CString::from_vec_with_nul(fiber).unwrap().into();
+                        fiber
+                    })
+                    .clone()
+            });
+
+            let fiber = self.client.allocate_fiber_handle(fiber);
+
+            SpanInfo { fiber }
+        }
+        #[cfg(not(feature = "fibers"))]
+        {
+            SpanInfo {}
+        }
+    }
 }
 
 impl Default for TracyLayer {
@@ -171,6 +232,11 @@ where
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(id) else { return };
 
+        TRACY_SPAN_INFO
+            .write()
+            .unwrap()
+            .insert(id.into_u64(), self.span_info::<S>(&span).into());
+
         let mut extensions = span.extensions_mut();
         if extensions.get_mut::<TracyFields<C>>().is_none() {
             let mut fields =
@@ -183,6 +249,13 @@ where
             {
                 extensions.insert(fields);
             }
+        }
+    }
+
+    fn on_id_change(&self, old: &Id, new: &Id, _ctx: Context<'_, S>) {
+        let mut info = TRACY_SPAN_INFO.write().unwrap();
+        if let Some(old) = info.get(&old.into_u64()).cloned() {
+            info.insert(new.into_u64(), old);
         }
     }
 
@@ -241,6 +314,14 @@ where
             let metadata = span.metadata();
             let file = metadata.file().unwrap_or("<not available>");
             let line = metadata.line().unwrap_or(0);
+
+            let info = TRACY_SPAN_INFO
+                .read()
+                .unwrap()
+                .get(&id.into_u64())
+                .unwrap()
+                .clone();
+
             let span = |name: &str| {
                 (
                     self.client.clone().span_alloc(
@@ -255,6 +336,7 @@ where
                         line,
                         self.config.stack_depth(metadata),
                     ),
+                    info,
                     id.into_u64(),
                 )
             };
@@ -280,14 +362,25 @@ where
         };
 
         TRACY_SPAN_STACK.with(|s| {
+            #[cfg(feature = "fibers")]
+            if s.is_empty() {
+                stack_frame.1.fiber.enter();
+            }
             s.push(stack_frame);
         });
     }
 
     fn on_exit(&self, id: &Id, _: Context<S>) {
-        let stack_frame = TRACY_SPAN_STACK.with(VecCell::pop);
+        let stack_frame = TRACY_SPAN_STACK.with(|s| {
+            let stack_frame = s.pop();
+            #[cfg(feature = "fibers")]
+            if let (true, Some((_, info, _))) = (s.is_empty(), &stack_frame) {
+                info.fiber.leave();
+            }
+            stack_frame
+        });
 
-        if let Some((span, span_id)) = stack_frame {
+        if let Some((span, _, span_id)) = stack_frame {
             if id.into_u64() != span_id {
                 self.config.on_error(
                     &self.client,
@@ -306,6 +399,8 @@ where
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(&id) else { return };
+
+        TRACY_SPAN_INFO.write().unwrap().remove(&id.into_u64());
 
         if let Some(fields) = span.extensions_mut().get_mut::<TracyFields<C>>() {
             let buf = mem::take(&mut fields.fields);
@@ -381,6 +476,14 @@ mod utils {
     impl<T> VecCell<T> {
         pub const fn new() -> Self {
             Self(UnsafeCell::new(Vec::new()))
+        }
+
+        #[cfg(feature = "fibers")]
+        pub fn is_empty(&self) -> bool {
+            // SAFETY:
+            // The reference to the contents of the UnsafeCell remain strictly within this method.
+            // In addition, this method is not re-entrant.
+            unsafe { &mut *self.0.get() }.is_empty()
         }
 
         pub fn push(&self, item: T) {
